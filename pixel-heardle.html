@@ -1,0 +1,155 @@
+<!DOCTYPE html><html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>PIXEL HEARDLE</title>
+<link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#1a1033;--fg:#f4f0ff;--pri:#ffd23f;--ok:#3ddc84;--bad:#ff4d6d;--pan:#2b1b52}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:11px/1.9 'Press Start 2P',monospace;display:flex;justify-content:center;padding:16px}
+main{width:100%;max-width:520px}
+h1{color:var(--pri);font-size:18px;text-align:center;text-shadow:3px 3px #000}
+.box{background:var(--pan);border:4px solid #000;box-shadow:6px 6px 0 #000;padding:14px;margin:14px 0}
+button,input{font:inherit;color:inherit}
+button{background:var(--pri);color:#000;border:4px solid #000;box-shadow:4px 4px 0 #000;padding:10px 12px;cursor:pointer;margin:4px 4px 4px 0}
+button:active{transform:translate(4px,4px);box-shadow:none}
+button.alt{background:#7b5cff;color:#fff}
+input{width:100%;background:#000;border:4px solid var(--pri);padding:10px;margin:6px 0}
+.hide{display:none}
+#steps{display:flex;gap:4px;margin:8px 0}
+.st{flex:1;height:18px;border:3px solid #000;background:#3a2a6a}.st.used{background:var(--bad)}.st.cur{background:var(--pri)}
+#sug div{padding:8px;border:2px solid #000;background:#000;cursor:pointer}
+#sug div:hover{background:var(--pri);color:#000}
+small{opacity:.8;font-size:9px}code{color:var(--pri);word-break:break-all}
+img{width:96px;height:96px;image-rendering:pixelated;border:4px solid #000;display:block;margin:8px 0}
+</style></head><body><main>
+<h1>PIXEL HEARDLE</h1>
+
+<section id="setup" class="box hide">
+<p>1. Auf developer.spotify.com/dashboard eine App erstellen.</p>
+<p>2. Diese Redirect-URI eintragen:<br><code id="redir"></code></p>
+<p>3. Client-ID einfügen:</p>
+<input id="cid" placeholder="CLIENT-ID">
+<button onclick="login()">MIT SPOTIFY VERBINDEN</button>
+<small>Die Redirect-URI muss https:// oder http://127.0.0.1 sein.</small>
+</section>
+
+<section id="menu" class="box hide">
+<p>WÄHLE DEINE SONGS</p>
+<button onclick="start('liked')">LIKED SONGS</button>
+<button onclick="start('top')">TOP SONGS</button>
+<p>PLAYLISTS:</p><div id="pls"></div>
+<p id="msg"></p><small id="pst">PLAYER LÄDT...</small>
+</section>
+
+<section id="game" class="box hide">
+<div id="score"></div>
+<div id="steps"></div>
+<div id="ctrl">
+<button onclick="play()">&#9654; ABSPIELEN (<span id="len"></span>)</button>
+<input id="guess" placeholder="SONG / KÜNSTLER SUCHEN" autocomplete="off">
+<div id="sug"></div>
+<button onclick="submit()">RATEN</button><button class="alt" onclick="skip()">SKIP +</button>
+</div>
+<div id="res" class="hide"><p id="rt"></p><img id="cover" alt=""><button onclick="round()">NÄCHSTER SONG</button></div>
+<button class="alt" onclick="clearTimeout(timer);player.pause();show('menu')">MENÜ</button>
+</section>
+</main>
+<script>
+const $=id=>document.getElementById(id),LS=localStorage,API='https://api.spotify.com/v1';
+const REDIR=location.origin+location.pathname,STAGES=[1,2,4,8,15,30];
+let player,devId,pool=[],cur,stage=0,score=0,streak=0,timer,sel=null;
+const show=id=>['setup','menu','game'].forEach(s=>$(s).classList.toggle('hide',s!==id));
+const name=t=>`${t.name} – ${t.artists[0].name}`;
+$('redir').textContent=REDIR;$('cid').value=LS.cid||'';
+const b64=b=>btoa(String.fromCharCode(...new Uint8Array(b))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');
+
+async function login(){
+ const id=$('cid').value.trim();if(!id)return;LS.cid=id;
+ const v=b64(crypto.getRandomValues(new Uint8Array(48)));LS.ver=v;
+ const c=b64(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(v)));
+ location='https://accounts.spotify.com/authorize?'+new URLSearchParams({client_id:id,response_type:'code',redirect_uri:REDIR,code_challenge_method:'S256',code_challenge:c,scope:'streaming user-read-email user-read-private user-library-read playlist-read-private user-top-read user-modify-playback-state user-read-playback-state'});
+}
+async function token(body){
+ const r=await fetch('https://accounts.spotify.com/api/token',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({client_id:LS.cid,...body})});
+ const d=await r.json();if(!d.access_token)throw d;
+ LS.at=d.access_token;LS.exp=Date.now()+d.expires_in*1000-60000;if(d.refresh_token)LS.rt=d.refresh_token;
+}
+async function getTok(){if(Date.now()>(+LS.exp||0))await token({grant_type:'refresh_token',refresh_token:LS.rt});return LS.at}
+async function api(p,o={}){
+ const r=await fetch(p.startsWith('http')?p:API+p,{...o,headers:{Authorization:'Bearer '+await getTok(),'Content-Type':'application/json'}});
+ return r.status==204?null:r.json();
+}
+async function init(){
+ const code=new URLSearchParams(location.search).get('code');
+ if(code){try{await token({grant_type:'authorization_code',code,redirect_uri:REDIR,code_verifier:LS.ver})}catch(e){alert('Login fehlgeschlagen')}history.replaceState({},'',REDIR)}
+ if(!LS.rt)return show('setup');
+ initPlayer();show('menu');loadPlaylists();
+}
+function initPlayer(){
+ window.onSpotifyWebPlaybackSDKReady=()=>{
+  player=new Spotify.Player({name:'Pixel Heardle',getOAuthToken:async cb=>cb(await getTok()),volume:.7});
+  player.addListener('ready',e=>{devId=e.device_id;$('pst').textContent='PLAYER BEREIT'});
+  player.addListener('authentication_error',()=>$('pst').textContent='AUTH-FEHLER');
+  player.addListener('account_error',()=>$('pst').textContent='PREMIUM NÖTIG');
+  player.connect();
+ };
+ const s=document.createElement('script');s.src='https://sdk.scdn.co/spotify-player.js';document.head.appendChild(s);
+}
+async function loadPlaylists(){
+ const d=await api('/me/playlists?limit=50');
+ (d.items||[]).forEach(p=>{const b=document.createElement('button');b.className='alt';b.textContent=p.name.slice(0,22);b.onclick=()=>start('pl',p.id);$('pls').appendChild(b)});
+}
+async function fetchAll(url,map,max=4){
+ let out=[];
+ for(let i=0;i<max&&url;i++){const d=await api(url);out.push(...d.items.map(map));url=d.next}
+ return out;
+}
+async function start(kind,id){
+ if(!player||!devId)return $('msg').textContent='PLAYER NOCH NICHT BEREIT';
+ player.activateElement();$('msg').textContent='LADE SONGS...';
+ let t;
+ try{
+  if(kind=='liked')t=await fetchAll('/me/tracks?limit=50',i=>i.track);
+  else if(kind=='top')t=await fetchAll('/me/top/tracks?limit=50&time_range=long_term',i=>i,2);
+  else t=await fetchAll(`/playlists/${id}/tracks?limit=50`,i=>i.track);
+ }catch(e){return $('msg').textContent='FEHLER BEIM LADEN'}
+ pool=t.filter(x=>x&&x.uri&&x.uri.startsWith('spotify:track')&&!x.is_local);
+ if(pool.length<2)return $('msg').textContent='ZU WENIG SONGS';
+ $('msg').textContent='';score=streak=0;show('game');round();
+}
+function round(){
+ cur=pool[Math.random()*pool.length|0];stage=0;sel=null;
+ $('guess').value='';$('sug').innerHTML='';
+ $('res').classList.add('hide');$('ctrl').classList.remove('hide');draw();
+}
+function draw(){
+ $('steps').innerHTML=STAGES.map((s,i)=>`<div class="st ${i<stage?'used':i==stage?'cur':''}"></div>`).join('');
+ $('len').textContent=STAGES[stage]+' SEK';$('score').textContent=`PUNKTE ${score} | SERIE ${streak}`;
+}
+async function play(full){
+ clearTimeout(timer);
+ await api('/me/player/play?device_id='+devId,{method:'PUT',body:JSON.stringify({uris:[cur.uri],position_ms:0})});
+ if(!full)timer=setTimeout(()=>player.pause(),STAGES[stage]*1000);
+}
+function wrong(){clearTimeout(timer);player.pause();stage++;if(stage>=STAGES.length)return end(false);draw()}
+function skip(){wrong()}
+function submit(){
+ if(!sel)return;
+ if(sel.id==cur.id||name(sel)==name(cur))end(true);
+ else{$('guess').value='';sel=null;$('sug').innerHTML='';wrong()}
+}
+function end(win){
+ clearTimeout(timer);
+ if(win){score+=STAGES.length-stage;streak++}else streak=0;
+ $('ctrl').classList.add('hide');$('res').classList.remove('hide');
+ $('rt').innerHTML=(win?'<span style="color:var(--ok)">RICHTIG!</span>':'<span style="color:var(--bad)">LEIDER NEIN</span>')+'<br>'+name(cur).replace(/</g,'&lt;');
+ $('cover').src=(cur.album.images[1]||cur.album.images[0]||{}).url||'';
+ draw();play(true);
+}
+$('guess').oninput=e=>{
+ const q=e.target.value.toLowerCase();sel=null;$('sug').innerHTML='';if(q.length<2)return;
+ pool.filter(t=>name(t).toLowerCase().includes(q)).slice(0,5).forEach(t=>{
+  const d=document.createElement('div');d.textContent=name(t);
+  d.onclick=()=>{sel=t;$('guess').value=name(t);$('sug').innerHTML=''};$('sug').appendChild(d);
+ });
+};
+init();
+</script></body></html>
